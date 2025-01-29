@@ -1,0 +1,194 @@
+from datetime import datetime, timedelta
+import schedule
+import time
+import logging
+import json
+from pathlib import Path
+from email.message import EmailMessage
+import smtplib
+
+class InvoiceProcessor:
+    def __init__(self, check_interval=3, reminder_interval=4):
+        self.check_interval = check_interval
+        self.reminder_interval = reminder_interval
+        self.cycle_time = self._calculate_lcm(check_interval, reminder_interval)
+        self.base_unit = self._calculate_hcf(check_interval, reminder_interval)
+        
+        # Setup logging
+        logging.basicConfig(
+            filename='invoice_processor.log',
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        
+        # Load invoice database
+        self.invoices_db = self._load_invoice_db()
+        
+        # Reminder templates
+        self.reminder_templates = {
+            'first': "Your invoice {invoice_id} is due in 7 days",
+            'second': "Your invoice {invoice_id} is due in 3 days",
+            'final': "Your invoice {invoice_id} is now overdue"
+        }
+
+    def _calculate_lcm(self, a, b):
+        """Calculate Least Common Multiple"""
+        def lcm(a, b):
+            return abs(a * b) // self._calculate_hcf(a, b)
+        return lcm(a, b)
+
+    def _calculate_hcf(self, a, b):
+        """Calculate Highest Common Factor"""
+        while b:
+            a, b = b, a % b
+        return a
+
+    def _load_invoice_db(self):
+        """Load or create invoice database"""
+        db_path = Path('invoices.json')
+        if db_path.exists():
+            with open(db_path, 'r') as f:
+                return json.load(f)
+        return {
+            'pending': {},
+            'processed': {},
+            'reminded': set()
+        }
+
+    def _save_invoice_db(self):
+        """Save current state of invoice database"""
+        with open('invoices.json', 'w') as f:
+            # Convert set to list for JSON serialization
+            db_copy = self.invoices_db.copy()
+            db_copy['reminded'] = list(db_copy['reminded'])
+            json.dump(db_copy, f, indent=2)
+
+    def check_invoices(self):
+        """Check invoices for due dates every check_interval hours"""
+        try:
+            logging.info("Starting invoice check...")
+            current_time = datetime.now()
+            
+            for invoice_id, details in self.invoices_db['pending'].copy().items():
+                due_date = datetime.fromisoformat(details['due_date'])
+                days_until_due = (due_date - current_time).days
+                
+                if days_until_due <= 0:
+                    # Move to processed if overdue
+                    self._mark_invoice_processed(invoice_id, 'overdue')
+                    continue
+                
+                # Check if reminder needed
+                if days_until_due <= 7 and invoice_id not in self.invoices_db['reminded']:
+                    self._queue_reminder(invoice_id, days_until_due)
+            
+            self._save_invoice_db()
+            logging.info("Invoice check completed")
+            
+        except Exception as e:
+            logging.error(f"Invoice check failed: {str(e)}")
+
+    def send_reminders(self):
+        """Send queued reminders every reminder_interval hours"""
+        try:
+            logging.info("Starting reminder sending...")
+            
+            # Process reminder queue
+            for invoice_id in self.invoices_db['pending']:
+                if self._should_send_reminder(invoice_id):
+                    self._send_reminder(invoice_id)
+                    self.invoices_db['reminded'].add(invoice_id)
+            
+            self._save_invoice_db()
+            logging.info("Reminder sending completed")
+            
+        except Exception as e:
+            logging.error(f"Reminder sending failed: {str(e)}")
+
+    def _should_send_reminder(self, invoice_id):
+        """Check if reminder should be sent based on due date"""
+        if invoice_id in self.invoices_db['reminded']:
+            return False
+            
+        details = self.invoices_db['pending'].get(invoice_id)
+        if not details:
+            return False
+            
+        due_date = datetime.fromisoformat(details['due_date'])
+        days_until_due = (due_date - datetime.now()).days
+        
+        return days_until_due in [7, 3, 0]  # Reminder points
+
+    def _send_reminder(self, invoice_id):
+        """Send reminder email for specific invoice"""
+        details = self.invoices_db['pending'][invoice_id]
+        days_until_due = (datetime.fromisoformat(details['due_date']) - datetime.now()).days
+        
+        # Select appropriate template
+        if days_until_due == 7:
+            template = self.reminder_templates['first']
+        elif days_until_due == 3:
+            template = self.reminder_templates['second']
+        else:
+            template = self.reminder_templates['final']
+        
+        message = template.format(invoice_id=invoice_id)
+        self._send_email(details['email'], message)
+        logging.info(f"Reminder sent for invoice {invoice_id}")
+
+    def _send_email(self, recipient, message):
+        """Placeholder for email sending functionality"""
+        # In real implementation, configure with actual SMTP settings
+        logging.info(f"Would send email to {recipient}: {message}")
+
+    def _mark_invoice_processed(self, invoice_id, status):
+        """Move invoice from pending to processed with status"""
+        if invoice_id in self.invoices_db['pending']:
+            invoice = self.invoices_db['pending'].pop(invoice_id)
+            invoice['status'] = status
+            invoice['processed_date'] = datetime.now().isoformat()
+            self.invoices_db['processed'][invoice_id] = invoice
+
+    def add_invoice(self, invoice_id, amount, due_date, email):
+        """Add new invoice to the system"""
+        self.invoices_db['pending'][invoice_id] = {
+            'amount': amount,
+            'due_date': due_date.isoformat(),
+            'email': email,
+            'created_date': datetime.now().isoformat()
+        }
+        self._save_invoice_db()
+        logging.info(f"Added new invoice: {invoice_id}")
+
+    def start(self):
+        """Start the automated invoice processing system"""
+        logging.info(f"Starting Invoice Processor with cycle time: {self.cycle_time} hours")
+        logging.info(f"Base unit time: {self.base_unit} hour")
+        
+        # Schedule tasks
+        schedule.every(self.check_interval).hours.do(self.check_invoices)
+        schedule.every(self.reminder_interval).hours.do(self.send_reminders)
+        
+        # Run continuously
+        try:
+            while True:
+                schedule.run_pending()
+                time.sleep(60)  # Check schedule every minute
+        except KeyboardInterrupt:
+            logging.info("Invoice Processor shutting down...")
+            self._save_invoice_db()
+
+if __name__ == "__main__":
+    # Initialize processor with 3-hour check interval and 4-hour reminder interval
+    processor = InvoiceProcessor(check_interval=3, reminder_interval=4)
+    
+    # Add sample invoice
+    sample_due_date = datetime.now() + timedelta(days=7)
+    processor.add_invoice(
+        "INV-2024-001",
+        1000.00,
+        sample_due_date,
+        "customer@example.com"
+    )
+    
+    processor.start()
